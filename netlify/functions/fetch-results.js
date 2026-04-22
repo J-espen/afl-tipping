@@ -30,13 +30,10 @@ exports.handler = async (event) => {
   )
 
   try {
-    // Determine which round(s) to fetch
-    // If no round specified, find the most recently locked round without results
     let roundsToFetch = []
     if (round !== null) {
       roundsToFetch = [round]
     } else {
-      // Find locked rounds without complete results
       const { data: locks } = await supabase
         .from('round_locks')
         .select('round')
@@ -62,11 +59,13 @@ exports.handler = async (event) => {
     for (const r of roundsToFetch) {
       console.log(`[fetch-results] Fetching results for Round ${r}`)
 
-      // Squiggle uses round numbers directly; Opening Round = Round 0
-      // Note: Squiggle API round parameter: round 0 = Opening Round
       const url = `https://api.squiggle.com.au/?q=games;year=${SQUIGGLE_YEAR};round=${r}`
       const response = await fetch(url, {
-        headers: { 'User-Agent': 'AFL-Tipping-App/1.0 (contact: admin)' }
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; AFL-Tipping-App/1.0; +https://github.com/J-espen/afl-tipping)',
+          'Accept': 'application/json',
+          'Referer': 'https://squiggle.com.au'
+        }
       })
 
       if (!response.ok) throw new Error(`Squiggle API error: ${response.status}`)
@@ -76,7 +75,6 @@ exports.handler = async (event) => {
 
       console.log(`[fetch-results] Round ${r}: ${games.length} games from Squiggle`)
 
-      // Get our fixtures and lines for this round
       const { data: fixtures } = await supabase
         .from('fixtures')
         .select('*')
@@ -89,16 +87,14 @@ exports.handler = async (event) => {
         .eq('status', 'approved')
 
       for (const game of games) {
-        // Only process completed games (Squiggle: complete = 100)
         if (game.complete !== 100) continue
 
         const homeScore = game.hscore
         const awayScore = game.ascore
         if (homeScore == null || awayScore == null) continue
 
-        const margin = homeScore - awayScore // positive = home won
+        const margin = homeScore - awayScore
 
-        // Match to our fixture
         const fix = fixtures?.find(f =>
           teamMatch(f.home_team, game.hteam) ||
           teamMatch(f.home_team, game.ateam)
@@ -108,28 +104,22 @@ exports.handler = async (event) => {
           continue
         }
 
-        // Get our line for this fixture
         const line = lines?.find(l => l.match_num === fix.match_num)
         if (!line || line.line == null) continue
 
-        // If home/away are flipped between Squiggle and our data, adjust margin
         let adjustedMargin = margin
         if (teamMatch(fix.home_team, game.ateam)) {
-          adjustedMargin = -margin // Squiggle had them reversed
+          adjustedMargin = -margin
         }
 
-        // ATS calculation: home covers if (margin + line) > 0
-        // e.g. home is -23.5, wins by 24 → 24 + (-23.5) = 0.5 > 0 → home covers
         const atsWinner = (adjustedMargin + line.line) > 0 ? fix.home_team : fix.away_team
 
-        // Update line with result
         await supabase.from('lines').update({
           final_margin: adjustedMargin,
           ats_winner: atsWinner,
           updated_at: new Date().toISOString(),
         }).eq('round', r).eq('match_num', fix.match_num)
 
-        // Mark tips correct/incorrect
         const { data: gameTips } = await supabase
           .from('tips')
           .select('id, tip_team')
@@ -147,7 +137,6 @@ exports.handler = async (event) => {
       }
     }
 
-    // Rebuild leaderboard cache
     await rebuildLeaderboard(supabase)
 
     return {
