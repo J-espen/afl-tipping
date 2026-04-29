@@ -2,50 +2,77 @@ import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import { useAuth } from '../App'
 
-const CURRENT_ROUND = 5
-
 export default function TippingPage() {
   const user = useAuth()
-  const [round, setRound] = useState(CURRENT_ROUND)
+  const [round, setRound] = useState(null)
+  const [currentRound, setCurrentRound] = useState(null)
   const [fixtures, setFixtures] = useState([])
   const [lines, setLines] = useState([])
-  const [myTips, setMyTips] = useState({}) // { "match_num": "team" }
+  const [myTips, setMyTips] = useState({})
   const [locked, setLocked] = useState(false)
-  const [allTips, setAllTips] = useState([]) // all tips for this round (post-lock)
-  const [saving, setSaving] = useState(null) // match_num being saved
+  const [allTips, setAllTips] = useState([])
+  const [saving, setSaving] = useState(null)
   const [loading, setLoading] = useState(true)
-  const [maxRound, setMaxRound] = useState(CURRENT_ROUND)
+  const [maxRound, setMaxRound] = useState(24)
+
+  // On mount: find the current active round automatically
+  useEffect(() => {
+    async function findCurrentRound() {
+      // Current round = the lowest round number that is either:
+      // 1. Unlocked (tips still open), OR
+      // 2. The most recently locked round (if all are locked)
+      const { data: locks } = await supabase
+        .from('round_locks')
+        .select('round, locked')
+        .order('round', { ascending: true })
+
+      const { data: allFixtures } = await supabase
+        .from('fixtures')
+        .select('round')
+        .order('round', { ascending: false })
+        .limit(1)
+
+      const max = allFixtures?.[0]?.round ?? 24
+      setMaxRound(max)
+
+      // Find lowest unlocked round that has fixtures
+      const { data: roundsWithFixtures } = await supabase
+        .from('fixtures')
+        .select('round')
+      const fixtureRounds = [...new Set((roundsWithFixtures || []).map(f => f.round))].sort((a, b) => a - b)
+
+      const lockMap = {}
+      for (const l of (locks || [])) lockMap[l.round] = l.locked
+
+      // Find the first round that is unlocked
+      let active = fixtureRounds.find(r => !lockMap[r])
+
+      // If all rounds are locked, use the highest round with fixtures
+      if (active === undefined) {
+        active = fixtureRounds[fixtureRounds.length - 1] ?? 0
+      }
+
+      setCurrentRound(active)
+      setRound(active)
+    }
+    findCurrentRound()
+  }, [])
 
   const load = useCallback(async () => {
+    if (round === null) return
     setLoading(true)
 
-    // Fetch fixtures for this round
-    const { data: fix } = await supabase
-      .from('fixtures')
-      .select('*')
-      .eq('round', round)
-      .order('match_num')
-
-    // Fetch approved lines
-    const { data: lns } = await supabase
-      .from('lines')
-      .select('*')
-      .eq('round', round)
-      .eq('status', 'approved')
-
-    // Fetch lock status
-    const { data: lock } = await supabase
-      .from('round_locks')
-      .select('locked')
-      .eq('round', round)
-      .maybeSingle()
+    const [{ data: fix }, { data: lns }, { data: lock }] = await Promise.all([
+      supabase.from('fixtures').select('*').eq('round', round).order('match_num'),
+      supabase.from('lines').select('*').eq('round', round).eq('status', 'approved'),
+      supabase.from('round_locks').select('locked').eq('round', round).maybeSingle(),
+    ])
 
     const isLocked = lock?.locked ?? false
     setLocked(isLocked)
     setFixtures(fix || [])
     setLines(lns || [])
 
-    // My tips
     if (!user.isAdmin) {
       const { data: tips } = await supabase
         .from('tips')
@@ -60,25 +87,20 @@ export default function TippingPage() {
       setMyTips(tipMap)
     }
 
-    // If locked, load ALL tips for % display
     if (isLocked) {
       const { data: all } = await supabase
         .from('tips')
         .select('match_num, tip_team, participant, is_correct')
         .eq('round', round)
       setAllTips(all || [])
+    } else {
+      setAllTips([])
     }
 
     setLoading(false)
   }, [round, user.name, user.isAdmin])
 
   useEffect(() => { load() }, [load])
-
-  // Find max round that has fixtures
-  useEffect(() => {
-    supabase.from('fixtures').select('round').order('round', { ascending: false }).limit(1)
-      .then(({ data }) => { if (data?.[0]) setMaxRound(data[0].round) })
-  }, [])
 
   async function saveTip(matchNum, team) {
     if (locked) return
@@ -101,8 +123,7 @@ export default function TippingPage() {
   function getPickPct(matchNum, team) {
     const matchTips = allTips.filter(t => t.match_num === matchNum)
     if (!matchTips.length) return 0
-    const picked = matchTips.filter(t => t.tip_team === team).length
-    return Math.round((picked / matchTips.length) * 100)
+    return Math.round((matchTips.filter(t => t.tip_team === team).length / matchTips.length) * 100)
   }
 
   function getPickCount(matchNum, team) {
@@ -110,8 +131,10 @@ export default function TippingPage() {
   }
 
   const hasLines = lines.length > 0
+  const roundLabel = round === 0 ? 'Opening Round' : `Round ${round}`
 
-  if (loading) return <div className="text-center py-20 text-gray-400 animate-pulse">Loading Round {round}…</div>
+  if (round === null) return <div className="text-center py-20 text-gray-400 animate-pulse">Finding current round…</div>
+  if (loading) return <div className="text-center py-20 text-gray-400 animate-pulse">Loading {roundLabel}…</div>
 
   return (
     <div>
@@ -119,10 +142,17 @@ export default function TippingPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-extrabold text-white">
-            {round === 0 ? 'Opening Round' : `Round ${round}`}
+            {roundLabel}
+            {round === currentRound && (
+              <span className="ml-2 text-xs bg-afl-green/20 text-afl-green px-2 py-0.5 rounded-full font-semibold align-middle">Current</span>
+            )}
           </h1>
           <p className="text-gray-400 text-sm mt-0.5">
-            {locked ? '🔒 Round locked — tips are visible' : hasLines ? '✏️ Tips open — pick your winners' : '⏳ Lines not yet set for this round'}
+            {locked
+              ? '🔒 Round locked — tips are visible'
+              : hasLines
+              ? '✏️ Tips open — pick your winners'
+              : '⏳ Lines not yet set for this round'}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -132,15 +162,13 @@ export default function TippingPage() {
         </div>
       </div>
 
-      {/* No lines warning */}
       {!hasLines && !locked && (
         <div className="card p-5 text-center text-gray-400 border-dashed mb-4">
-          <p className="text-lg">📋 Lines haven't been set for Round {round} yet.</p>
+          <p className="text-lg">📋 Lines haven't been set for {roundLabel} yet.</p>
           <p className="text-sm mt-1">Check back closer to the round — the admin will publish them.</p>
         </div>
       )}
 
-      {/* Games */}
       <div className="space-y-3">
         {fixtures.map(fix => {
           const line = getLine(fix.match_num)
@@ -148,7 +176,6 @@ export default function TippingPage() {
           const isSaving = saving === fix.match_num
           const canTip = !locked && hasLines && !user.isAdmin
 
-          // Format line display: e.g. "Sydney -23.5" means Sydney needs to win by 24+
           let homeLineDisplay = ''
           let awayLineDisplay = ''
           if (line) {
@@ -206,7 +233,6 @@ export default function TippingPage() {
                         )}
                       </div>
 
-                      {/* Post-lock pick % bar */}
                       {locked && (
                         <div className="mt-2">
                           <div className="flex justify-between text-xs text-gray-400 mb-1">
@@ -223,7 +249,6 @@ export default function TippingPage() {
                 })}
               </div>
 
-              {/* Post-lock: show who picked what */}
               {locked && (
                 <div className="mt-3 pt-3 border-t border-gray-800">
                   <div className="flex flex-wrap gap-1.5">
@@ -248,7 +273,6 @@ export default function TippingPage() {
         })}
       </div>
 
-      {/* Tip progress for current user */}
       {!locked && hasLines && !user.isAdmin && (
         <div className="mt-6 card p-4 flex items-center justify-between">
           <span className="text-gray-300 text-sm">Your tips this round</span>
