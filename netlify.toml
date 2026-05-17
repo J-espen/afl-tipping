@@ -17,7 +17,7 @@
 
 # Fetch results every Sunday 11pm AEST = Sunday 1pm UTC
 [functions."fetch-results"]
-  schedule = "0 13 * * 0"
+  schedule = "0 13 * * 1"
 
 [[plugins]]
   package = "@netlify/plugin-functions-install-core"
