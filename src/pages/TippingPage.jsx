@@ -14,6 +14,14 @@ export default function TippingPage() {
   const [saving, setSaving] = useState(null)
   const [loading, setLoading] = useState(true)
   const [maxRound, setMaxRound] = useState(24)
+  const [today, setToday] = useState('')
+
+  useEffect(() => {
+    // Get today's date in AEST (UTC+10)
+    const now = new Date()
+    const aest = new Date(now.getTime() + (10 * 60 * 60 * 1000))
+    setToday(aest.toISOString().split('T')[0])
+  }, [])
 
   useEffect(() => {
     async function findCurrentRound() {
@@ -40,7 +48,6 @@ export default function TippingPage() {
       for (const l of (locks || [])) lockMap[l.round] = l.locked
 
       let active = fixtureRounds.find(r => !lockMap[r])
-
       if (active === undefined) {
         active = fixtureRounds[fixtureRounds.length - 1] ?? 0
       }
@@ -56,4 +63,238 @@ export default function TippingPage() {
     setLoading(true)
 
     const [{ data: fix }, { data: lns }, { data: lock }] = await Promise.all([
-      supabase.from('fi
+      supabase.from('fixtures').select('*').eq('round', round).order('match_num'),
+      supabase.from('lines').select('*').eq('round', round).eq('status', 'approved'),
+      supabase.from('round_locks').select('locked').eq('round', round).maybeSingle(),
+    ])
+
+    const isLocked = lock?.locked ?? false
+    setLocked(isLocked)
+    setFixtures(fix || [])
+    setLines(lns || [])
+
+    if (!user.isAdmin) {
+      const { data: tips } = await supabase
+        .from('tips')
+        .select('match_num, tip_team, is_correct')
+        .eq('round', round)
+        .eq('participant', user.name)
+
+      const tipMap = {}
+      for (const t of (tips || [])) {
+        tipMap[t.match_num] = { team: t.tip_team, correct: t.is_correct }
+      }
+      setMyTips(tipMap)
+    }
+
+    if (isLocked) {
+      const { data: all } = await supabase
+        .from('tips')
+        .select('match_num, tip_team, participant, is_correct')
+        .eq('round', round)
+      setAllTips(all || [])
+    } else {
+      setAllTips([])
+    }
+
+    setLoading(false)
+  }, [round, user.name, user.isAdmin])
+
+  useEffect(() => { load() }, [load])
+
+  // A game is locked if the round is locked OR the game date is today or in the past
+  function gameIsLocked(fix) {
+    if (locked) return true
+    if (!today) return false
+    return fix.game_date <= today
+  }
+
+  async function saveTip(matchNum, team, fix) {
+    if (gameIsLocked(fix)) return
+    setSaving(matchNum)
+    await supabase.from('tips').upsert({
+      round,
+      match_num: matchNum,
+      participant: user.name,
+      tip_team: team,
+      is_correct: null,
+    }, { onConflict: 'round,match_num,participant' })
+    setMyTips(prev => ({ ...prev, [matchNum]: { team, correct: null } }))
+    setSaving(null)
+  }
+
+  function getLine(matchNum) {
+    return lines.find(l => l.match_num === matchNum)
+  }
+
+  function getPickPct(matchNum, team) {
+    const matchTips = allTips.filter(t => t.match_num === matchNum)
+    if (!matchTips.length) return 0
+    return Math.round((matchTips.filter(t => t.tip_team === team).length / matchTips.length) * 100)
+  }
+
+  function getPickCount(matchNum, team) {
+    return allTips.filter(t => t.match_num === matchNum && t.tip_team === team).length
+  }
+
+  const hasLines = lines.length > 0
+  const roundLabel = round === 0 ? 'Opening Round' : `Round ${round}`
+
+  if (round === null) return <div className="text-center py-20 text-gray-400 animate-pulse">Finding current round…</div>
+  if (loading) return <div className="text-center py-20 text-gray-400 animate-pulse">Loading {roundLabel}…</div>
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-extrabold text-white">
+            {roundLabel}
+            {round === currentRound && (
+              <span className="ml-2 text-xs bg-afl-green/20 text-afl-green px-2 py-0.5 rounded-full font-semibold align-middle">Current</span>
+            )}
+          </h1>
+          <p className="text-gray-400 text-sm mt-0.5">
+            {locked
+              ? '🔒 Round locked — tips are visible'
+              : hasLines
+              ? '✏️ Tips open — pick your winners'
+              : '⏳ Lines not yet set for this round'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setRound(r => Math.max(0, r - 1))} disabled={round === 0} className="btn-secondary px-3 py-2 disabled:opacity-30">◀</button>
+          <span className="text-sm font-bold text-gray-300 w-8 text-center">{round}</span>
+          <button onClick={() => setRound(r => Math.min(maxRound, r + 1))} disabled={round === maxRound} className="btn-secondary px-3 py-2 disabled:opacity-30">▶</button>
+        </div>
+      </div>
+
+      {!hasLines && !locked && (
+        <div className="card p-5 text-center text-gray-400 border-dashed mb-4">
+          <p className="text-lg">📋 Lines haven't been set for {roundLabel} yet.</p>
+          <p className="text-sm mt-1">Check back closer to the round — the admin will publish them.</p>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {fixtures.map(fix => {
+          const line = getLine(fix.match_num)
+          const myTip = myTips[fix.match_num]
+          const isSaving = saving === fix.match_num
+          const gameLocked = gameIsLocked(fix)
+          const canTip = !gameLocked && hasLines && !user.isAdmin
+
+          let homeLineDisplay = ''
+          let awayLineDisplay = ''
+          if (line) {
+            const l = line.line
+            homeLineDisplay = l < 0 ? `${l}` : `+${l}`
+            awayLineDisplay = l < 0 ? `+${Math.abs(l)}` : `-${l}`
+          }
+
+          return (
+            <div key={fix.match_num} className={`card p-4 ${myTip ? 'border-afl-green/40' : ''}`}>
+              <div className="flex items-center justify-between mb-3">
+                <span className="text-xs text-gray-500">Game {fix.match_num} · {fix.game_date}</span>
+                <div className="flex items-center gap-2">
+                  {gameLocked && !locked && (
+                    <span className="text-xs bg-gray-700 text-gray-400 px-2 py-0.5 rounded-full">
+                      🔒 Game started
+                    </span>
+                  )}
+                  {locked && line?.ats_winner && (
+                    <span className="text-xs bg-afl-green/20 text-afl-green px-2 py-0.5 rounded-full font-semibold">
+                      ✓ {line.ats_winner} covered
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                {[
+                  { team: fix.home_team, lineStr: homeLineDisplay },
+                  { team: fix.away_team, lineStr: awayLineDisplay },
+                ].map(({ team, lineStr }) => {
+                  const isMyPick = myTip?.team === team
+                  const wasCorrect = isMyPick && myTip?.correct === true
+                  const wasWrong = isMyPick && myTip?.correct === false
+                  const pct = (locked || gameLocked) ? getPickPct(fix.match_num, team) : 0
+                  const cnt = (locked || gameLocked) ? getPickCount(fix.match_num, team) : 0
+
+                  return (
+                    <button
+                      key={team}
+                      onClick={() => canTip && saveTip(fix.match_num, team, fix)}
+                      disabled={!canTip || isSaving}
+                      className={`
+                        relative rounded-xl p-3 text-left border-2 transition-all duration-150
+                        ${isMyPick
+                          ? wasCorrect ? 'border-afl-green bg-green-900/40'
+                          : wasWrong ? 'border-red-500 bg-red-900/30'
+                          : 'border-afl-green bg-green-900/20'
+                          : 'border-gray-700 bg-gray-800/50 hover:border-gray-500'}
+                        ${canTip ? 'cursor-pointer' : 'cursor-default'}
+                        ${gameLocked && !isMyPick ? 'opacity-50' : ''}
+                      `}
+                    >
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <p className="font-semibold text-sm text-white leading-tight">{team}</p>
+                          {line && <p className={`text-xs mt-0.5 font-mono font-bold ${lineStr.startsWith('-') ? 'text-red-400' : 'text-green-400'}`}>{lineStr}</p>}
+                        </div>
+                        {isMyPick && (
+                          <span className="text-lg">
+                            {wasCorrect ? '✅' : wasWrong ? '❌' : isSaving ? '⏳' : '✓'}
+                          </span>
+                        )}
+                      </div>
+
+                      {(locked || gameLocked) && (
+                        <div className="mt-2">
+                          <div className="flex justify-between text-xs text-gray-400 mb-1">
+                            <span>{cnt} tip{cnt !== 1 ? 's' : ''}</span>
+                            <span>{pct}%</span>
+                          </div>
+                          <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                            <div className="h-full bg-afl-green rounded-full transition-all" style={{ width: `${pct}%` }} />
+                          </div>
+                        </div>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {(locked || gameLocked) && (
+                <div className="mt-3 pt-3 border-t border-gray-800">
+                  <div className="flex flex-wrap gap-1.5">
+                    {allTips.filter(t => t.match_num === fix.match_num).map(t => (
+                      <span
+                        key={t.participant}
+                        className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                          t.is_correct === true ? 'bg-green-900/60 text-green-300'
+                          : t.is_correct === false ? 'bg-red-900/60 text-red-300'
+                          : 'bg-gray-800 text-gray-400'
+                        }`}
+                      >
+                        {t.participant}: {t.tip_team.split(' ').slice(-1)[0]}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {!locked && hasLines && !user.isAdmin && (
+        <div className="mt-6 card p-4 flex items-center justify-between">
+          <span className="text-gray-300 text-sm">Your tips this round</span>
+          <span className="font-bold text-afl-gold">
+            {Object.keys(myTips).length} / {fixtures.length}
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
